@@ -1,0 +1,151 @@
+# ShopGuard AI — Azure DevOps CI/CD Pipeline
+# Runs Playwright E2E + backend unit tests on every PR
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+
+pr:
+  branches:
+    include:
+      - main
+      - develop
+
+variables:
+  NODE_VERSION: "20.x"
+  PYTHON_VERSION: "3.11"
+  CI: "true"
+
+stages:
+  - stage: Build
+    displayName: "Build & Unit Tests"
+    jobs:
+      - job: BackendTests
+        displayName: "Backend Unit Tests"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "$(PYTHON_VERSION)"
+
+          - script: |
+              cd backend
+              pip install -r requirements.txt
+              pytest tests/unit -v --cov=app --cov-report=xml --cov-report=term
+            displayName: "Run pytest"
+
+          - task: PublishCodeCoverageResults@2
+            inputs:
+              summaryFileLocation: "backend/coverage.xml"
+            condition: succeededOrFailed()
+
+      - job: FrontendBuild
+        displayName: "Frontend Build"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: "$(NODE_VERSION)"
+
+          - script: |
+              cd frontend
+              npm ci
+              npm run build
+            displayName: "Build React app"
+
+  - stage: E2E
+    displayName: "Playwright E2E Tests"
+    dependsOn: Build
+    jobs:
+      - job: PlaywrightTests
+        displayName: "E2E Test Suite"
+        pool:
+          vmImage: "ubuntu-latest"
+        strategy:
+          parallel: 3
+          maxParallel: 3
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "$(PYTHON_VERSION)"
+
+          - task: NodeTool@0
+            inputs:
+              versionSpec: "$(NODE_VERSION)"
+
+          - script: |
+              cd backend
+              pip install -r requirements.txt
+              cd ../frontend
+              npm ci
+              cd ../tests/e2e
+              npm ci
+              npx playwright install --with-deps chromium
+            displayName: "Install dependencies"
+
+          - script: |
+              cd backend
+              uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+              BACKEND_PID=$!
+              cd ../frontend
+              npm run dev -- --host 0.0.0.0 --port 5173 &
+              FRONTEND_PID=$!
+              sleep 10
+              cd ../tests/e2e
+              SHARD_INDEX=$(($(System.JobPositionInPhase)))
+              SHARD_TOTAL=$(($(System.TotalJobsInPhase)))
+              npx playwright test --shard=${SHARD_INDEX}/${SHARD_TOTAL} --retries=2 --reporter=html,junit
+              TEST_EXIT=$?
+              kill $BACKEND_PID $FRONTEND_PID 2>/dev/null || true
+              exit $TEST_EXIT
+            displayName: "Run Playwright (sharded)"
+            env:
+              CI: "true"
+              BASE_URL: "http://localhost:5173"
+              API_URL: "http://localhost:8000"
+
+          - task: PublishTestResults@2
+            inputs:
+              testResultsFormat: "JUnit"
+              testResultsFiles: "tests/e2e/results.xml"
+              mergeTestResults: true
+            condition: always()
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: "tests/e2e/playwright-report"
+              artifact: "playwright-report-$(System.JobPositionInPhase)"
+            condition: always()
+
+  - stage: AIAnalysis
+    displayName: "AI Failure Analysis"
+    dependsOn: E2E
+    condition: failed()
+    jobs:
+      - job: AnalyzeFailures
+        displayName: "RAG Failure Analyzer"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "$(PYTHON_VERSION)"
+
+          - script: |
+              cd backend
+              pip install -r requirements.txt
+              python -m app.ai.analyzer --input ../tests/e2e/test-results/
+            displayName: "Run AI failure analyzer"
+            env:
+              GEMINI_API_KEY: $(GEMINI_API_KEY)
+              CHROMA_HOST: $(CHROMA_HOST)
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: "backend/test_artifacts/ai_analysis"
+              artifact: "ai-failure-analysis"
+            condition: always()
